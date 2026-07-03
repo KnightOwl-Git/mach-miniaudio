@@ -32,11 +32,11 @@ pipeline: ?*gpu.RenderPipeline = null,
 app_thread: mach.Thread,
 window: mach.ObjectID,
 
-const bgm_data = @embedFile("bit_bit_loop_kevin_macleod.wav");
-const sfx_data = @embedFile("sword1.wav");
+const bgm_data = @embedFile("bit_bit_loop_kevin_macleod.opus");
+const sfx_data = @embedFile("sword1.opus");
 
-var bgm_decoder: c.ma_decoder = undefined;
-var sfx_decoder: c.ma_decoder = undefined;
+var bgm_data_source: c.ma_audio_buffer = undefined;
+var sfx_data_source: c.ma_audio_buffer = undefined;
 var device: c.ma_device = undefined;
 
 fn dataCallback(p_device: [*c]c.ma_device, p_output: ?*anyopaque, p_input: ?*const anyopaque, frame_count: c.ma_uint32) callconv(.c) void {
@@ -44,18 +44,20 @@ fn dataCallback(p_device: [*c]c.ma_device, p_output: ?*anyopaque, p_input: ?*con
     _ = p_input; // autofix
     var frames_read: u64 = 0;
     var bgm_output: [4096]f32 = undefined;
-    var result = c.ma_decoder_read_pcm_frames(&bgm_decoder, &bgm_output, frame_count, &frames_read);
-
+    var result = c.ma_data_source_read_pcm_frames(&bgm_data_source, &bgm_output, frame_count, &frames_read);
+    // std.debug.print("read result: {d}\n", .{result});
+    // std.debug.print("frames read: {d}\n", .{frames_read});
+    //
     var sfx_output: [4096]f32 = undefined;
     var sfx_frames_read: u64 = 0;
-    result = c.ma_decoder_read_pcm_frames(&sfx_decoder, &sfx_output, frame_count, &sfx_frames_read);
+    result = c.ma_data_source_read_pcm_frames(&sfx_data_source, &sfx_output, frame_count, &sfx_frames_read);
 
     // if (result != c.MA_SUCCESS) {
     //     std.log.err("could not read frames \n", .{});
     // }
     if (frames_read < frame_count) {
         //reached the end. loop
-        if (c.ma_decoder_seek_to_pcm_frame(&bgm_decoder, 0) != c.MA_SUCCESS) {
+        if (c.ma_data_source_seek_to_pcm_frame(&bgm_data_source, 0) != c.MA_SUCCESS) {
             std.log.err("could not loop music\n", .{});
         }
     }
@@ -67,7 +69,7 @@ fn dataCallback(p_device: [*c]c.ma_device, p_output: ?*anyopaque, p_input: ?*con
     const p_output_pointer: [*]f32 = @ptrCast(@alignCast(p_output));
     const p_output_to_mix = p_output_pointer[0..sample_count];
 
-    //lower volume
+    //lower volume and mix bgm with sfx
     for (p_output_to_mix, 0..) |*value, i| {
         value.* += bgm_output[i] + sfx_output[i];
         value.* *= 0.1;
@@ -88,6 +90,7 @@ pub fn init(
     });
 
     var config = c.ma_device_config_init(c.ma_device_type_playback);
+    const gpa = std.heap.c_allocator;
 
     config.playback.format = c.ma_format_f32;
     config.playback.channels = 2;
@@ -111,18 +114,58 @@ pub fn init(
     decoder_config.format = device.playback.format;
     decoder_config.channels = device.playback.channels;
 
-    //load bgm
+    //init decoders
 
+    var bgm_decoder: c.ma_decoder = undefined;
+    var sfx_decoder: c.ma_decoder = undefined;
     if (c.ma_decoder_init_memory(bgm_data, bgm_data.len, &decoder_config, &bgm_decoder) != c.MA_SUCCESS) {
         return error.FileInitError;
     }
-    //load sfx
     if (c.ma_decoder_init_memory(sfx_data, sfx_data.len, &decoder_config, &sfx_decoder) != c.MA_SUCCESS) {
         return error.FileInitError;
     }
 
-    //start sfx at the end of the file
-    _ = c.ma_decoder_seek_to_pcm_frame(&sfx_decoder, sfx_data.len);
+    //store pcm frame lengths
+    var bgm_length: u64 = undefined;
+    _ = c.ma_decoder_get_length_in_pcm_frames(&bgm_decoder, &bgm_length);
+    var sfx_length: u64 = undefined;
+    _ = c.ma_decoder_get_length_in_pcm_frames(&sfx_decoder, &sfx_length);
+
+    //allocate buffers for the decoders to decode into. Not worrying about memory clean up for this demo.
+    const channel_count = device.playback.channels;
+    const bgm_buffer = try gpa.alloc(f32, bgm_length * channel_count);
+    const sfx_buffer = try gpa.alloc(f32, bgm_length * channel_count);
+
+    var frames_read: u64 = undefined;
+
+    //read from decoders into buffers
+    _ = c.ma_decoder_read_pcm_frames(&bgm_decoder, bgm_buffer.ptr, bgm_length, &frames_read);
+    _ = c.ma_decoder_read_pcm_frames(&sfx_decoder, sfx_buffer.ptr, sfx_length, &frames_read);
+
+    //init audio buffers for use in callback
+    _ = c.ma_audio_buffer_init(
+        &c.ma_audio_buffer_config_init(
+            c.ma_format_f32,
+            2,
+            bgm_length,
+            bgm_buffer.ptr,
+            null,
+        ),
+        &bgm_data_source,
+    );
+    _ = c.ma_audio_buffer_init(
+        &c.ma_audio_buffer_config_init(
+            c.ma_format_f32,
+            2,
+            sfx_length,
+            sfx_buffer.ptr,
+            null,
+        ),
+        &sfx_data_source,
+    );
+
+    // start sfx at the end of the file
+    _ = c.ma_data_source_seek_to_pcm_frame(&sfx_data_source, sfx_length);
 
     //create device
 
@@ -193,7 +236,7 @@ pub fn appTick(core: *mach.Core) void {
                 switch (key.key) {
                     .escape => core.exit(),
                     else => {
-                        _ = c.ma_decoder_seek_to_pcm_frame(&sfx_decoder, 7000); //skip silence to make low latency apparent
+                        _ = c.ma_data_source_seek_to_pcm_frame(&sfx_data_source, 7000); //skip silence to make low latency apparent
                     },
                 }
             },
